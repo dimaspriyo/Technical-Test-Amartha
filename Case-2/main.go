@@ -25,6 +25,7 @@ type ReconcileRequest struct {
 
 type TransactionsReadResponse struct {
 	Rows                 [][]string
+	MapRows              map[int]bool
 	TransactionCounter   int
 	amount               int
 	UnmatchedTransaction map[int]Row
@@ -65,8 +66,9 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 	var validTransactionsKey []int
 	var requestBody ReconcileRequest
 	var transactionsResult TransactionsReadResponse
+	transactionsResult.MapRows = make(map[int]bool)
 	unbufferedCh := make(chan TransactionPerRowResponse)
-	matchedBankTransaction := make(map[string]Row)
+	matchedBankTransaction := make(map[string][]Row)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -127,7 +129,7 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 
 	go func() {
 		for result := range unbufferedCh {
-			fmt.Println("Incoming Amount: ", result)
+			fmt.Printf("[%d] Incoming Amount: %d", result.Amount, result.Amount)
 			for k, item := range transactionsResult.Rows {
 				amountVal, err := strconv.Atoi(item[1])
 				if err != nil {
@@ -150,28 +152,45 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 				if amountVal == rowAmount && transactionType == result.Row[2] && !isValid {
 
 					validTransactionsKey = append(validTransactionsKey, k)
-					matchedBankTransaction[result.Bank] = Row{
+					matchedBankTransaction[result.Bank] = append(matchedBankTransaction[result.Bank], Row{
 						RowKey:          k,
 						TrxID:           result.Row[0],
 						Amount:          amountVal,
 						Type:            result.Row[1],
 						TransactionTime: result.Row[2],
-					}
+					})
 
 					delete(transactionsResult.UnmatchedTransaction, k+1)
-					fmt.Println("ASD")
 					break
 				}
 			}
 		}
 	}()
 
+	fmt.Println("Stop At Waiting")
 	wg.Wait()
-	cancel()
+	close(maxChannels)
+	fmt.Println("finish Waiting")
+
+	//for _, v := range transactionsResult.Rows {
+	//	IsExistInArray()
+	//}
 
 	fmt.Println("Total Transaction Processed: ", transactionsResult.TransactionCounter)
 	fmt.Println("Total Matched Transaction: ", transactionsResult.TransactionCounter-len(transactionsResult.UnmatchedTransaction))
 	fmt.Println("Total Unmatched Transaction: ", len(transactionsResult.UnmatchedTransaction))
+	fmt.Println("List Of Missing Transactions in Bank Statements ")
+	for _, v := range transactionsResult.UnmatchedTransaction {
+		fmt.Println(v)
+	}
+
+	fmt.Println("List Of Missing Bank Statements In Transactions ")
+	//for _, itemMatchedBankTransaction := range matchedBankTransaction {
+	//	for _, v := range itemMatchedBankTransaction {
+	//		transactionsResult.
+	//	}
+	//}
+
 	fmt.Println("HERE")
 }
 
@@ -179,74 +198,68 @@ func readBankStatementsV2(ctx context.Context, ch chan ChannelResponse, unbuffer
 	defer wg.Done()
 	response := ChannelResponse{}
 
-	select {
-	case <-ctx.Done():
-		//wg.Done()
-		fmt.Println("Context cancelled")
-		return
-	case ch <- response:
-		bankStatementFile, err := os.Open(path)
-		if err != nil {
-			//wg.Done()
-			fmt.Println(err)
-			response.err = errors.New("Failed to open transcations path")
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("Context cancelled")
+			return
+		default:
+			bankStatementFile, err := os.Open(path)
+			if err != nil {
+				fmt.Println(err)
+				response.err = errors.New("Failed to open transcations path")
+				ch <- response
+				return
+			}
+
+			defer bankStatementFile.Close()
+			bankStatementReader := csv.NewReader(bankStatementFile)
+			_, err = bankStatementReader.Read()
+			if err != nil {
+				err = errors.New("Error reading header row")
+			}
+
+			for {
+				record, err := bankStatementReader.Read()
+				if err == io.EOF {
+					break
+				}
+
+				if err != nil {
+					fmt.Println(err)
+					response.err = errors.New("Failed to read transcations")
+				}
+
+				transactionDate, err := time.Parse(time.RFC3339, record[3])
+				if err != nil {
+					fmt.Println(err)
+				}
+
+				isInDateRange := startDate.Before(transactionDate.UTC()) && endDate.After(transactionDate.UTC())
+				if !isInDateRange {
+					continue
+				}
+
+				amountVal, err := strconv.Atoi(record[1])
+				if err != nil {
+					fmt.Println(err)
+				}
+				response.amount = response.amount + amountVal
+				response.result = append(response.result, record)
+
+				fmt.Println("Send Amount:", response.amount, " From Path: ", path)
+				unbufferedCh <- TransactionPerRowResponse{
+					Row:    record,
+					Amount: amountVal,
+					Bank:   path,
+				}
+
+			}
+
+			fmt.Println("Final Result Path: ", path, " Amount: ", response.amount)
 			ch <- response
 			return
 		}
-
-		defer bankStatementFile.Close()
-		bankStatementReader := csv.NewReader(bankStatementFile)
-		_, err = bankStatementReader.Read()
-		if err != nil {
-			err = errors.New("Error reading header row")
-			//wg.Done()
-		}
-
-		for {
-			record, err := bankStatementReader.Read()
-			if err == io.EOF {
-				//wg.Done()
-				break
-			}
-
-			if err != nil {
-				fmt.Println(err)
-				response.err = errors.New("Failed to read transcations")
-				//wg.Done()
-			}
-
-			transactionDate, err := time.Parse(time.RFC3339, record[3])
-			if err != nil {
-				fmt.Println(err)
-				//wg.Done()
-			}
-
-			isInDateRange := startDate.Before(transactionDate.UTC()) && endDate.After(transactionDate.UTC())
-			if !isInDateRange {
-				continue
-			}
-
-			amountVal, err := strconv.Atoi(record[1])
-			if err != nil {
-				fmt.Println(err)
-				//wg.Done()
-			}
-			response.amount = response.amount + amountVal
-			response.result = append(response.result, record)
-
-			fmt.Println("Send Amount:", response.amount, " From Path: ", path)
-			unbufferedCh <- TransactionPerRowResponse{
-				Row:    record,
-				Amount: amountVal,
-				Bank:   path,
-			}
-
-		}
-
-		fmt.Println("Final Result Path: ", path, " Amount: ", response.amount)
-		wg.Done()
-		ch <- response
-		return
 	}
 }
 
@@ -297,7 +310,7 @@ func readTransactions(path string, startDate, endDate time.Time) (TransactionsRe
 			return TransactionsReadResponse{}, err
 		}
 		response.amount = response.amount + amountVal
-		response.TransactionCounter++
+
 		response.Rows = append(response.Rows, record)
 		response.UnmatchedTransaction[response.TransactionCounter] = Row{
 			RowKey:          response.TransactionCounter,
@@ -306,6 +319,9 @@ func readTransactions(path string, startDate, endDate time.Time) (TransactionsRe
 			Type:            record[1],
 			TransactionTime: record[2],
 		}
+		response.MapRows[response.TransactionCounter] = true
+
+		response.TransactionCounter++
 	}
 	return response, nil
 }
@@ -327,6 +343,13 @@ func isTransactionValid(list []int, val int) (isValid bool) {
 	return
 }
 
-func removeByIndex(s []int, index int) []int {
-	return append(s[:index], s[index+1:]...)
+func IsExistInArray(list []string, indexKey int) bool {
+	var isExist bool
+	for k, _ := range list {
+		if k == indexKey {
+			isExist = true
+			break
+		}
+	}
+	return isExist
 }
