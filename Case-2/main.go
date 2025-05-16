@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"io"
 	"log"
@@ -48,10 +49,12 @@ type ChannelResponse struct {
 }
 
 type BankStatementPerRowResponse struct {
+	IsEof  bool
 	Index  int
 	Bank   string
 	Row    []string
 	Amount int
+	ctx    context.Context
 }
 
 type Row struct {
@@ -118,7 +121,7 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 
 	//	(Read Transactions)
 	totalChannels := len(requestBody.BankStatementsPath)
-	maxChannels := make(chan ChannelResponse, totalChannels)
+	maxBankStatementChannels := make(chan ChannelResponse, totalChannels)
 	transactionsResult, err = readTransactions(requestBody.TransactionsPath, startDate, endDate)
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -127,54 +130,71 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 
 	for _, v := range requestBody.BankStatementsPath {
 		wg.Add(1)
-		go readBankStatementsV2(ctx, maxChannels, unbufferedCh, &wg, v, startDate, endDate)
+		ctx = context.WithValue(ctx, "RequestId", uuid.New().String())
+		go readBankStatementsV2(ctx, maxBankStatementChannels, unbufferedCh, &wg, v, startDate, endDate)
 	}
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+		finishRead := 0
 		for result := range unbufferedCh {
-			for k, item := range transactionsResult.Rows {
-				amountVal, err := strconv.Atoi(item[1])
-				if err != nil {
-					http.Error(w, "Failed to parse amount", http.StatusBadRequest)
-					return
+			if !result.IsEof {
+				for k, item := range transactionsResult.Rows {
+					amountVal, err := strconv.Atoi(item[1])
+					if err != nil {
+						http.Error(w, "Failed to parse amount", http.StatusBadRequest)
+						return
+					}
+
+					transactionType := "KREDIT"
+					if result.Amount < 1 {
+						transactionType = "DEBIT"
+					}
+
+					rowAmount := absInt(result.Amount)
+					isValid := isTransactionValid(validTransactionsKey, amountVal)
+					if amountVal == rowAmount && transactionType == result.Row[2] && !isValid {
+						logger(result.ctx, fmt.Sprintf("Delete Unmatched transaction: %v", transactionsResult.UnmatchedTransaction[k]))
+						logger(result.ctx, fmt.Sprintf("Delete Unmatched bank statement  %v", unmatchedBankStatement[result.Bank][k]))
+
+						validTransactionsKey = append(validTransactionsKey, k)
+						delete(transactionsResult.UnmatchedTransaction, k)
+						delete(unmatchedBankStatement[result.Bank], k)
+
+						logger(result.ctx, fmt.Sprintf("Available Unmatched bank statement  %v", unmatchedBankStatement[result.Bank]))
+						logger(result.ctx, fmt.Sprintf("Available Unmatched transaction: %v", transactionsResult.UnmatchedTransaction[k]))
+
+						break
+					}
+
+					if _, ok := unmatchedBankStatement[result.Bank]; !ok {
+						unmatchedBankStatement[result.Bank] = make(map[int]Row)
+					}
+
+					// Append unmatched bank transaction
+					unmatchedBankStatement[result.Bank][result.Index] = Row{
+						TransactionRowIndex: k,
+						TrxID:               result.Row[0],
+						Amount:              amountVal,
+						Type:                result.Row[1],
+						TransactionTime:     result.Row[2],
+					}
+
 				}
-
-				transactionType := "KREDIT"
-				if result.Amount < 1 {
-					transactionType = "DEBIT"
-				}
-
-				rowAmount := absInt(result.Amount)
-				isValid := isTransactionValid(validTransactionsKey, amountVal)
-				if amountVal == rowAmount && transactionType == result.Row[2] && !isValid {
-					fmt.Println("Delete Unmatched transaction: ", transactionsResult.UnmatchedTransaction[k])
-					fmt.Println("Delete Unmatched bank statement ", result.Bank, " : ", unmatchedBankStatement[result.Bank][k])
-
-					validTransactionsKey = append(validTransactionsKey, k)
-					delete(transactionsResult.UnmatchedTransaction, k)
-					delete(unmatchedBankStatement[result.Bank], k)
+			} else {
+				logger(result.ctx, fmt.Sprintf("Read Bank: %s Send EOF signla", result.Bank))
+				finishRead++
+				if finishRead == len(requestBody.BankStatementsPath) {
 					break
 				}
-
-				if _, ok := unmatchedBankStatement[result.Bank]; !ok {
-					unmatchedBankStatement[result.Bank] = make(map[int]Row)
-				}
-
-				// Append unmatched bank transaction
-				unmatchedBankStatement[result.Bank][result.Index] = Row{
-					TransactionRowIndex: k,
-					TrxID:               result.Row[0],
-					Amount:              amountVal,
-					Type:                result.Row[1],
-					TransactionTime:     result.Row[2],
-				}
-
 			}
 		}
+		logger(ctx, "Finish Read All Bank Statement Per Row")
 	}()
 
 	wg.Wait()
-	close(maxChannels)
+	close(maxBankStatementChannels)
 
 	var response ReconcileResponse
 
@@ -207,49 +227,59 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 	w.Write(payload)
 }
 
-func readBankStatementsV2(ctx context.Context, ch chan ChannelResponse, unbufferedCh chan BankStatementPerRowResponse, wg *sync.WaitGroup, path string, startDate, endDate time.Time) {
+func readBankStatementsV2(ctx context.Context, maxBankStatementChannels chan ChannelResponse, unbufferedCh chan BankStatementPerRowResponse, wg *sync.WaitGroup, path string, startDate, endDate time.Time) {
 	defer wg.Done()
 	response := ChannelResponse{}
 	var transactionRowIndex int
 
+	logger(ctx, fmt.Sprintf("Start Readin Bank Statement: %s", path))
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("Context cancelled")
+			logger(ctx, fmt.Sprintf("context canceled"))
 			return
 		default:
 			bankStatementFile, err := os.Open(path)
 			if err != nil {
+				logger(ctx, err.Error())
 				response.err = err
-				ch <- response
+				maxBankStatementChannels <- response
+				bankStatementFile.Close()
 				return
 			}
 
-			defer bankStatementFile.Close()
 			bankStatementReader := csv.NewReader(bankStatementFile)
 			_, err = bankStatementReader.Read()
 			if err != nil {
+				logger(ctx, err.Error())
 				response.err = err
-				ch <- response
+				maxBankStatementChannels <- response
+				bankStatementFile.Close()
 				return
 			}
 
 			for {
 				record, err := bankStatementReader.Read()
 				if err == io.EOF {
+					logger(ctx, err.Error())
+					bankStatementFile.Close()
 					break
 				}
 
 				if err != nil {
+					logger(ctx, err.Error())
 					response.err = err
-					ch <- response
+					maxBankStatementChannels <- response
+					bankStatementFile.Close()
 					return
 				}
 
 				transactionDate, err := time.Parse(time.RFC3339, record[3])
 				if err != nil {
+					logger(ctx, err.Error())
 					response.err = err
-					ch <- response
+					maxBankStatementChannels <- response
+					bankStatementFile.Close()
 					return
 				}
 
@@ -260,23 +290,31 @@ func readBankStatementsV2(ctx context.Context, ch chan ChannelResponse, unbuffer
 
 				amountVal, err := strconv.Atoi(record[1])
 				if err != nil {
+					logger(ctx, err.Error())
 					response.err = err
-					ch <- response
+					maxBankStatementChannels <- response
+					bankStatementFile.Close()
 					return
 				}
 				response.amount = response.amount + amountVal
 				response.result = append(response.result, record)
 
-				unbufferedCh <- BankStatementPerRowResponse{
+				row := BankStatementPerRowResponse{
 					Index:  transactionRowIndex,
 					Row:    record,
 					Amount: amountVal,
 					Bank:   path,
+					ctx:    ctx,
 				}
+				logger(ctx, fmt.Sprintf("Send to unbuffered: %v", row))
+				unbufferedCh <- row
 				transactionRowIndex++
 			}
 
-			ch <- response
+			logger(ctx, fmt.Sprintf("Send to maxChannel: %v", response))
+			unbufferedCh <- BankStatementPerRowResponse{IsEof: true, ctx: ctx, Bank: path}
+			maxBankStatementChannels <- response
+			bankStatementFile.Close()
 			return
 		}
 	}
@@ -356,4 +394,13 @@ func isTransactionValid(list []int, val int) (isValid bool) {
 		}
 	}
 	return
+}
+
+func getRequestId(ctx context.Context) string {
+	return ctx.Value("RequestId").(string)
+
+}
+
+func logger(ctx context.Context, msg string) {
+	fmt.Println(getRequestId(ctx), msg)
 }
