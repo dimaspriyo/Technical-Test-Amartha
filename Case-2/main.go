@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/gorilla/mux"
 	"io"
@@ -126,20 +125,10 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	fmt.Println("Total transactions read:", transactionsResult.TransactionCounter)
-	fmt.Println("Total amount read:", transactionsResult.amount)
-
-	// V2 Read Bank Statements
-
 	for _, v := range requestBody.BankStatementsPath {
 		wg.Add(1)
 		go readBankStatementsV2(ctx, maxChannels, unbufferedCh, &wg, v, startDate, endDate)
 	}
-
-	//go func() {
-	//	wg.Wait()
-	//	close(maxChannels)
-	//}()
 
 	go func() {
 		for result := range unbufferedCh {
@@ -156,11 +145,6 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 					transactionType = "DEBIT"
 				}
 
-				// Only mark transaction that :
-				// 1. Equal amount
-				// 2. Equal type (DEBIT / KREDIT)
-				// 3. never been inserted in validTransactionKey
-				//fmt.Println("Compare")
 				rowAmount := absInt(result.Amount)
 				isValid := isTransactionValid(validTransactionsKey, amountVal)
 				if amountVal == rowAmount && transactionType == result.Row[2] && !isValid {
@@ -192,10 +176,6 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 	close(maxChannels)
 	fmt.Println("finish Waiting")
 
-	//for _, v := range transactionsResult.Rows {
-	//	IsExistInArray()
-	//}
-
 	var response ReconcileResponse
 
 	var missingTransactions []Row
@@ -216,22 +196,6 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 		MissingTransactions:   missingTransactions,
 		MissingBankStatements: missingBankStatements,
 	}
-
-	//fmt.Println("Total Transaction Processed: ", transactionsResult.TransactionCounter)
-	//fmt.Println("Total Matched Transaction: ", transactionsResult.TransactionCounter-len(transactionsResult.UnmatchedTransaction))
-	//fmt.Println("Total Unmatched Transaction: ", len(transactionsResult.UnmatchedTransaction))
-	//fmt.Println("List Of Missing Transactions in Bank Statements ")
-	//for _, v := range transactionsResult.UnmatchedTransaction {
-	//	fmt.Println(v)
-	//}
-	//
-	//fmt.Println("List Of Missing Bank Statements In Transactions ")
-	//for k, itemMatchedBankTransaction := range unmatchedBankStatement {
-	//	fmt.Println("Bank Path: ", k)
-	//	for _, v := range itemMatchedBankTransaction {
-	//
-	//	}
-	//}
 
 	payload, err := json.Marshal(response)
 	if err != nil {
@@ -256,8 +220,7 @@ func readBankStatementsV2(ctx context.Context, ch chan ChannelResponse, unbuffer
 		default:
 			bankStatementFile, err := os.Open(path)
 			if err != nil {
-				fmt.Println(err)
-				response.err = errors.New("Failed to open transcations path")
+				response.err = err
 				ch <- response
 				return
 			}
@@ -266,7 +229,9 @@ func readBankStatementsV2(ctx context.Context, ch chan ChannelResponse, unbuffer
 			bankStatementReader := csv.NewReader(bankStatementFile)
 			_, err = bankStatementReader.Read()
 			if err != nil {
-				err = errors.New("Error reading header row")
+				response.err = err
+				ch <- response
+				return
 			}
 
 			for {
@@ -276,13 +241,16 @@ func readBankStatementsV2(ctx context.Context, ch chan ChannelResponse, unbuffer
 				}
 
 				if err != nil {
-					fmt.Println(err)
-					response.err = errors.New("Failed to read transcations")
+					response.err = err
+					ch <- response
+					return
 				}
 
 				transactionDate, err := time.Parse(time.RFC3339, record[3])
 				if err != nil {
-					fmt.Println(err)
+					response.err = err
+					ch <- response
+					return
 				}
 
 				isInDateRange := startDate.Before(transactionDate.UTC()) && endDate.After(transactionDate.UTC())
@@ -292,12 +260,13 @@ func readBankStatementsV2(ctx context.Context, ch chan ChannelResponse, unbuffer
 
 				amountVal, err := strconv.Atoi(record[1])
 				if err != nil {
-					fmt.Println(err)
+					response.err = err
+					ch <- response
+					return
 				}
 				response.amount = response.amount + amountVal
 				response.result = append(response.result, record)
 
-				fmt.Println("Send Amount:", response.amount, " From Path: ", path)
 				unbufferedCh <- BankStatementPerRowResponse{
 					Index:  transactionRowIndex,
 					Row:    record,
@@ -307,7 +276,6 @@ func readBankStatementsV2(ctx context.Context, ch chan ChannelResponse, unbuffer
 				transactionRowIndex++
 			}
 
-			fmt.Println("Final Result Path: ", path, " Amount: ", response.amount)
 			ch <- response
 			return
 		}
@@ -322,8 +290,6 @@ func readTransactions(path string, startDate, endDate time.Time) (TransactionsRe
 
 	transactionFile, err := os.Open(path)
 	if err != nil {
-		err = errors.New("Failed to open transactions path")
-		fmt.Println(err)
 		return TransactionsReadResponse{}, err
 	}
 
@@ -332,7 +298,6 @@ func readTransactions(path string, startDate, endDate time.Time) (TransactionsRe
 
 	_, err = transactionsReader.Read()
 	if err != nil {
-		err = errors.New("Error reading header row")
 		return TransactionsReadResponse{}, err
 	}
 
@@ -342,13 +307,11 @@ func readTransactions(path string, startDate, endDate time.Time) (TransactionsRe
 			break
 		}
 		if err != nil {
-			fmt.Println(err)
 			return TransactionsReadResponse{}, err
 		}
 
 		transactionDate, err := time.Parse(time.RFC3339, record[3])
 		if err != nil {
-			fmt.Println(err)
 			return TransactionsReadResponse{}, err
 		}
 
@@ -359,7 +322,6 @@ func readTransactions(path string, startDate, endDate time.Time) (TransactionsRe
 
 		amountVal, err := strconv.Atoi(record[1])
 		if err != nil {
-			fmt.Println(err)
 			return TransactionsReadResponse{}, err
 		}
 		response.amount = response.amount + amountVal
@@ -394,15 +356,4 @@ func isTransactionValid(list []int, val int) (isValid bool) {
 		}
 	}
 	return
-}
-
-func IsExistInArray(list []string, indexKey int) bool {
-	var isExist bool
-	for k, _ := range list {
-		if k == indexKey {
-			isExist = true
-			break
-		}
-	}
-	return isExist
 }
