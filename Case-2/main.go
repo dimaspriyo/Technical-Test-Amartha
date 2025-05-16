@@ -132,7 +132,6 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 
 	go func() {
 		for result := range unbufferedCh {
-			fmt.Printf("[%d] Incoming Amount: %d", result.Amount, result.Amount)
 			for k, item := range transactionsResult.Rows {
 				amountVal, err := strconv.Atoi(item[1])
 				if err != nil {
@@ -148,6 +147,9 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 				rowAmount := absInt(result.Amount)
 				isValid := isTransactionValid(validTransactionsKey, amountVal)
 				if amountVal == rowAmount && transactionType == result.Row[2] && !isValid {
+					fmt.Println("Delete Unmatched transaction: ", transactionsResult.UnmatchedTransaction[k])
+					fmt.Println("Delete Unmatched bank statement ", result.Bank, " : ", unmatchedBankStatement[result.Bank][k])
+
 					validTransactionsKey = append(validTransactionsKey, k)
 					delete(transactionsResult.UnmatchedTransaction, k)
 					delete(unmatchedBankStatement[result.Bank], k)
@@ -171,10 +173,8 @@ func reconcile(w http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	fmt.Println("Stop At Waiting")
 	wg.Wait()
 	close(maxChannels)
-	fmt.Println("finish Waiting")
 
 	var response ReconcileResponse
 
