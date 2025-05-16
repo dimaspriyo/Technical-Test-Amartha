@@ -15,4 +15,4 @@
 
 
 ## Screenshoot
-![Screenshoot](https://github.com/dimaspriyo/Technical-Test-Amartha/blob/main/screenshoot.png?raw=true)
+![Screenshoot](https://github.com/dimaspriyo/Technical-Test-Amartha/blob/main/Case-2/screenshot.png)
